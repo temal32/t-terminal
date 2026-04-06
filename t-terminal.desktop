@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=t-terminal
+GenericName=Terminal Emulator
+Comment=Terminal emulator with tabs, search, zoom, and selection-aware Ctrl+C copy
+Keywords=cmd;command;commandline;console;shell;terminal;prompt;
+Exec=/usr/bin/t-terminal
+Icon=utilities-terminal
+Terminal=false
+Categories=System;TerminalEmulator;
+StartupNotify=true

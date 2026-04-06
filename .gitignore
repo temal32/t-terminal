@@ -1,0 +1,5 @@
+.codex
+*.pyc
+__pycache__/
+build/
+t-terminal.deb
