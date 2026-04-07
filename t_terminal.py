@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import argparse
+import json
 import os
 import pathlib
 import pwd
@@ -21,9 +22,54 @@ from gi.repository import Gdk, Gio, GLib, Gtk, Pango, Vte
 
 APP_ID = "com.temal.tterminal"
 APP_NAME = "t-terminal"
-APP_VERSION = "1.0"
+APP_VERSION = "1.2.1"
 DEFAULT_FONT = "Monospace 12"
 URL_PATTERN = r"(?:https?|ftp)://[^\s\"'<>]+|mailto:[^\s\"'<>]+|file://[^\s\"'<>]+"
+CONFIG_DIR = pathlib.Path.home() / ".config" / "t-terminal"
+SETTINGS_PATH = CONFIG_DIR / "settings.json"
+DEFAULT_BACKGROUND_OPACITY = 1.0
+COMPACT_CSS = b"""
+window.t-terminal-window headerbar {
+  min-height: 34px;
+  padding-top: 0;
+  padding-bottom: 0;
+}
+
+window.t-terminal-window button.compact-button {
+  padding: 2px;
+  min-width: 24px;
+  min-height: 24px;
+}
+
+window.t-terminal-window notebook header.top tabs tab {
+  padding: 2px 6px;
+  min-height: 26px;
+  margin: 0;
+}
+
+window.t-terminal-window notebook header.top tabs tab button {
+  padding: 0;
+  min-width: 16px;
+  min-height: 16px;
+}
+
+window.t-terminal-window box.compact-search-box {
+  padding: 4px;
+}
+
+window.t-terminal-window box.terminal-root,
+window.t-terminal-window notebook.terminal-notebook,
+window.t-terminal-window notebook.terminal-notebook stack,
+window.t-terminal-window scrolledwindow.terminal-scroller,
+window.t-terminal-window scrolledwindow.terminal-scroller viewport {
+  background-color: transparent;
+  background-image: none;
+}
+
+window.t-terminal-window eventbox.terminal-surface {
+  background-image: none;
+}
+"""
 INTERACTIVE_SHELL_FLAGS = {
     "bash": ["-i"],
     "sh": ["-i"],
@@ -144,6 +190,48 @@ def shorten_title(title: str, length: int = 28) -> str:
     return title[: length - 3] + "..."
 
 
+def normalize_background_opacity(value: object) -> float:
+    try:
+        numeric_value = float(value)
+    except (TypeError, ValueError):
+        numeric_value = DEFAULT_BACKGROUND_OPACITY
+    return max(0.0, min(1.0, numeric_value))
+
+
+def load_settings() -> dict[str, float]:
+    settings = {"background_opacity": DEFAULT_BACKGROUND_OPACITY}
+    try:
+        if SETTINGS_PATH.exists():
+            raw_settings = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
+            if isinstance(raw_settings, dict):
+                settings["background_opacity"] = normalize_background_opacity(
+                    raw_settings.get("background_opacity", DEFAULT_BACKGROUND_OPACITY)
+                )
+    except (OSError, ValueError, TypeError) as error:
+        log_debug(f"could not load settings: {error}")
+    return settings
+
+
+def save_settings(settings: dict[str, float]) -> None:
+    try:
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        SETTINGS_PATH.write_text(json.dumps(settings, indent=2), encoding="utf-8")
+    except OSError as error:
+        log_debug(f"could not save settings: {error}")
+
+
+def install_application_css() -> None:
+    provider = Gtk.CssProvider()
+    provider.load_from_data(COMPACT_CSS)
+    screen = Gdk.Screen.get_default()
+    if screen is not None:
+        Gtk.StyleContext.add_provider_for_screen(
+            screen,
+            provider,
+            Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION,
+        )
+
+
 class TerminalTab(Gtk.Box):
     def __init__(
         self,
@@ -160,6 +248,7 @@ class TerminalTab(Gtk.Box):
         self.fallback_commands = build_shell_fallback_commands() if self.default_shell_launch else []
         self.current_command_description = ""
         self.last_spawn_monotonic = 0.0
+        self.base_background_color: Gdk.RGBA | None = None
 
         self.terminal = Vte.Terminal()
         self.terminal.set_font(Pango.FontDescription(DEFAULT_FONT))
@@ -172,6 +261,7 @@ class TerminalTab(Gtk.Box):
         self.terminal.set_audible_bell(False)
         self.terminal.set_allow_hyperlink(True)
         self.terminal.set_cursor_blink_mode(Vte.CursorBlinkMode.SYSTEM)
+        self.terminal.set_clear_background(False)
         self.terminal.add_events(Gdk.EventMask.BUTTON_PRESS_MASK | Gdk.EventMask.SCROLL_MASK)
         self.terminal.connect("key-press-event", self.on_terminal_key_press)
         self.terminal.connect("selection-changed", self.on_selection_changed)
@@ -182,10 +272,20 @@ class TerminalTab(Gtk.Box):
 
         self.url_match_tag = self.register_url_match()
 
-        scroller = Gtk.ScrolledWindow()
-        scroller.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
-        scroller.add(self.terminal)
-        self.pack_start(scroller, True, True, 0)
+        self.background_surface = Gtk.EventBox()
+        self.background_surface.set_visible_window(True)
+        self.background_surface.get_style_context().add_class("terminal-surface")
+
+        self.scroller = Gtk.ScrolledWindow()
+        self.scroller.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        self.scroller.set_shadow_type(Gtk.ShadowType.NONE)
+        self.scroller.get_style_context().add_class("terminal-scroller")
+        self.scroller.add(self.terminal)
+        self.background_surface.add(self.scroller)
+        self.pack_start(self.background_surface, True, True, 0)
+
+        self.capture_base_background_color()
+        self.apply_background_opacity(self.window.background_opacity)
 
         self.show_all()
         self.spawn()
@@ -242,6 +342,42 @@ class TerminalTab(Gtk.Box):
         tag = self.terminal.match_add_regex(regex, 0)
         self.terminal.match_set_cursor_name(tag, "pointer")
         return tag
+
+    def capture_base_background_color(self) -> None:
+        background = self.terminal.get_color_background_for_draw()
+        if background is not None:
+            self.base_background_color = background.copy()
+            return
+
+        fallback = Gdk.RGBA()
+        fallback.parse("rgb(0, 0, 0)")
+        self.base_background_color = fallback
+
+    def apply_background_opacity(self, opacity: float) -> None:
+        if self.base_background_color is None:
+            self.capture_base_background_color()
+        if self.base_background_color is None:
+            return
+
+        transparent = Gdk.RGBA()
+        transparent.parse("rgba(0, 0, 0, 0)")
+        self.apply_widget_background(self.scroller, transparent)
+        self.apply_widget_background(self.terminal, transparent)
+
+        background = self.base_background_color.copy()
+        background.alpha = normalize_background_opacity(opacity)
+        self.apply_widget_background(self.background_surface, background)
+
+    def apply_widget_background(self, widget: Gtk.Widget, color: Gdk.RGBA | None) -> None:
+        for state in (
+            Gtk.StateFlags.NORMAL,
+            Gtk.StateFlags.ACTIVE,
+            Gtk.StateFlags.PRELIGHT,
+            Gtk.StateFlags.SELECTED,
+            Gtk.StateFlags.INSENSITIVE,
+            Gtk.StateFlags.BACKDROP,
+        ):
+            widget.override_background_color(state, color)
 
     def update_title(self, title: str | None) -> None:
         cleaned_title = title.strip() if title else "Shell"
@@ -456,14 +592,20 @@ class TTerminalWindow(Gtk.ApplicationWindow):
     ) -> None:
         super().__init__(application=app)
         self.startup_directory = startup_directory
+        self.settings = load_settings()
+        self.background_opacity = normalize_background_opacity(self.settings["background_opacity"])
         self.font_scale = 1.0
         self.is_window_fullscreen = False
         self.tab_labels: dict[TerminalTab, Gtk.Label] = {}
+        self.appearance_dialog: Gtk.Dialog | None = None
+        self.opacity_scale: Gtk.Scale | None = None
 
         self.set_default_size(1180, 780)
         self.set_title(APP_NAME)
         self.set_icon_name("utilities-terminal")
+        self.enable_rgba_visual_if_available()
         self.connect("window-state-event", self.on_window_state_event)
+        self.get_style_context().add_class("t-terminal-window")
 
         self.create_actions()
         self.build_ui()
@@ -476,32 +618,43 @@ class TTerminalWindow(Gtk.ApplicationWindow):
     def build_ui(self) -> None:
         self.header_bar = Gtk.HeaderBar()
         self.header_bar.set_show_close_button(True)
-        self.header_bar.set_title(APP_NAME)
+        self.header_bar.set_has_subtitle(False)
+        self.header_title_label = Gtk.Label(label=APP_NAME)
+        self.header_title_label.set_ellipsize(Pango.EllipsizeMode.END)
+        self.header_bar.set_custom_title(self.header_title_label)
         self.set_titlebar(self.header_bar)
 
-        self.new_tab_button = Gtk.Button.new_from_icon_name("list-add-symbolic", Gtk.IconSize.BUTTON)
+        self.new_tab_button = Gtk.Button.new_from_icon_name("list-add-symbolic", Gtk.IconSize.MENU)
         self.new_tab_button.set_tooltip_text("Open a new tab")
+        self.new_tab_button.set_relief(Gtk.ReliefStyle.NONE)
+        self.new_tab_button.get_style_context().add_class("compact-button")
         self.new_tab_button.connect("clicked", lambda *_: self.create_tab())
         self.header_bar.pack_start(self.new_tab_button)
 
         self.search_toggle = Gtk.ToggleButton()
-        self.search_toggle.add(Gtk.Image.new_from_icon_name("edit-find-symbolic", Gtk.IconSize.BUTTON))
+        self.search_toggle.add(Gtk.Image.new_from_icon_name("edit-find-symbolic", Gtk.IconSize.MENU))
         self.search_toggle.set_tooltip_text("Show the search bar")
+        self.search_toggle.set_relief(Gtk.ReliefStyle.NONE)
+        self.search_toggle.get_style_context().add_class("compact-button")
         self.search_toggle.connect("toggled", self.on_search_toggle_toggled)
         self.header_bar.pack_end(self.search_toggle)
 
         self.menu_button = Gtk.MenuButton()
-        self.menu_button.set_image(Gtk.Image.new_from_icon_name("open-menu-symbolic", Gtk.IconSize.BUTTON))
+        self.menu_button.set_image(Gtk.Image.new_from_icon_name("open-menu-symbolic", Gtk.IconSize.MENU))
+        self.menu_button.set_relief(Gtk.ReliefStyle.NONE)
+        self.menu_button.get_style_context().add_class("compact-button")
         self.menu_button.set_menu_model(self.build_app_menu())
         self.header_bar.pack_end(self.menu_button)
 
         root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        root.get_style_context().add_class("terminal-root")
         self.add(root)
 
         self.search_bar = Gtk.SearchBar()
         self.search_bar.connect("notify::search-mode-enabled", self.on_search_mode_changed)
         search_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
-        search_box.set_border_width(6)
+        search_box.set_border_width(4)
+        search_box.get_style_context().add_class("compact-search-box")
 
         self.search_entry = Gtk.SearchEntry()
         self.search_entry.set_placeholder_text("Search in terminal output")
@@ -516,16 +669,22 @@ class TTerminalWindow(Gtk.ApplicationWindow):
 
         previous_button = Gtk.Button.new_from_icon_name("go-up-symbolic", Gtk.IconSize.BUTTON)
         previous_button.set_tooltip_text("Find previous match")
+        previous_button.set_relief(Gtk.ReliefStyle.NONE)
+        previous_button.get_style_context().add_class("compact-button")
         previous_button.connect("clicked", lambda *_: self.find_previous())
         search_box.pack_start(previous_button, False, False, 0)
 
         next_button = Gtk.Button.new_from_icon_name("go-down-symbolic", Gtk.IconSize.BUTTON)
         next_button.set_tooltip_text("Find next match")
+        next_button.set_relief(Gtk.ReliefStyle.NONE)
+        next_button.get_style_context().add_class("compact-button")
         next_button.connect("clicked", lambda *_: self.find_next())
         search_box.pack_start(next_button, False, False, 0)
 
         close_search_button = Gtk.Button.new_from_icon_name("window-close-symbolic", Gtk.IconSize.BUTTON)
         close_search_button.set_tooltip_text("Hide the search bar")
+        close_search_button.set_relief(Gtk.ReliefStyle.NONE)
+        close_search_button.get_style_context().add_class("compact-button")
         close_search_button.connect("clicked", lambda *_: self.search_bar.set_search_mode(False))
         search_box.pack_start(close_search_button, False, False, 0)
 
@@ -536,6 +695,7 @@ class TTerminalWindow(Gtk.ApplicationWindow):
         self.notebook.set_scrollable(True)
         self.notebook.set_group_name(APP_ID)
         self.notebook.popup_enable()
+        self.notebook.get_style_context().add_class("terminal-notebook")
         self.notebook.connect("switch-page", self.on_switch_page)
         root.pack_start(self.notebook, True, True, 0)
 
@@ -550,6 +710,7 @@ class TTerminalWindow(Gtk.ApplicationWindow):
             "find": self.action_find,
             "find-next": self.action_find_next,
             "find-previous": self.action_find_previous,
+            "show-appearance": self.action_show_appearance,
             "zoom-in": self.action_zoom_in,
             "zoom-out": self.action_zoom_out,
             "zoom-reset": self.action_zoom_reset,
@@ -584,6 +745,7 @@ class TTerminalWindow(Gtk.ApplicationWindow):
         menu.append_section(None, edit_section)
 
         view_section = Gio.Menu()
+        view_section.append("Appearance", "win.show-appearance")
         view_section.append("Zoom In", "win.zoom-in")
         view_section.append("Zoom Out", "win.zoom-out")
         view_section.append("Reset Zoom", "win.zoom-reset")
@@ -599,6 +761,15 @@ class TTerminalWindow(Gtk.ApplicationWindow):
 
     def get_default_working_directory(self) -> str:
         return self.startup_directory or get_home_directory()
+
+    def enable_rgba_visual_if_available(self) -> None:
+        screen = Gdk.Screen.get_default()
+        if screen is None or not screen.is_composited():
+            return
+        rgba_visual = screen.get_rgba_visual()
+        if rgba_visual is not None:
+            self.set_app_paintable(True)
+            self.set_visual(rgba_visual)
 
     def create_tab(
         self,
@@ -625,6 +796,7 @@ class TTerminalWindow(Gtk.ApplicationWindow):
         close_button.set_relief(Gtk.ReliefStyle.NONE)
         close_button.set_focus_on_click(False)
         close_button.set_tooltip_text("Close tab")
+        close_button.get_style_context().add_class("compact-button")
         close_button.connect("clicked", lambda *_: self.close_tab(tab))
 
         box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
@@ -679,12 +851,12 @@ class TTerminalWindow(Gtk.ApplicationWindow):
         active_tab = self.get_active_tab()
         title = active_tab.get_display_title() if active_tab else APP_NAME
         self.set_title(f"{title} - {APP_NAME}")
-        self.header_bar.set_subtitle(title)
+        self.header_title_label.set_text(shorten_title(title, 42))
 
     def update_action_sensitivity(self) -> None:
         active_tab = self.get_active_tab()
         has_selection = bool(active_tab and active_tab.terminal.get_has_selection())
-        for name in ("copy", "paste", "select-all", "find", "find-next", "find-previous", "close-tab"):
+        for name in ("copy", "paste", "select-all", "find", "find-next", "find-previous", "close-tab", "show-appearance"):
             self.lookup_action(name).set_enabled(active_tab is not None)
         self.lookup_action("copy").set_enabled(has_selection)
 
@@ -736,6 +908,68 @@ class TTerminalWindow(Gtk.ApplicationWindow):
             tab = self.notebook.get_nth_page(page_index)
             if isinstance(tab, TerminalTab):
                 tab.set_font_scale(self.font_scale)
+
+    def set_background_opacity(self, opacity: float, persist: bool = True) -> None:
+        self.background_opacity = normalize_background_opacity(opacity)
+        for page_index in range(self.notebook.get_n_pages()):
+            tab = self.notebook.get_nth_page(page_index)
+            if isinstance(tab, TerminalTab):
+                tab.apply_background_opacity(self.background_opacity)
+
+        if persist:
+            self.settings["background_opacity"] = self.background_opacity
+            save_settings(self.settings)
+
+    def show_appearance_dialog(self) -> None:
+        if self.appearance_dialog is not None:
+            self.appearance_dialog.present()
+            return
+
+        dialog = Gtk.Dialog(title="Appearance", transient_for=self, flags=Gtk.DialogFlags.MODAL)
+        dialog.add_button("Close", Gtk.ResponseType.CLOSE)
+        dialog.set_default_size(360, -1)
+        content_area = dialog.get_content_area()
+        content_area.set_border_width(12)
+
+        grid = Gtk.Grid(column_spacing=12, row_spacing=10)
+        content_area.add(grid)
+
+        title_label = Gtk.Label(label="Background opacity")
+        title_label.set_xalign(0.0)
+        grid.attach(title_label, 0, 0, 1, 1)
+
+        opacity_adjustment = Gtk.Adjustment(
+            value=round(self.background_opacity * 100),
+            lower=0,
+            upper=100,
+            step_increment=1,
+            page_increment=5,
+            page_size=0,
+        )
+        opacity_scale = Gtk.Scale(orientation=Gtk.Orientation.HORIZONTAL, adjustment=opacity_adjustment)
+        opacity_scale.set_digits(0)
+        opacity_scale.set_draw_value(True)
+        opacity_scale.set_hexpand(True)
+        opacity_scale.connect("value-changed", self.on_opacity_scale_changed)
+        grid.attach(opacity_scale, 0, 1, 1, 1)
+
+        hint_label = Gtk.Label(label="0 means fully transparent background, 100 means fully opaque.")
+        hint_label.set_xalign(0.0)
+        grid.attach(hint_label, 0, 2, 1, 1)
+
+        dialog.connect("response", self.on_appearance_dialog_response)
+        dialog.show_all()
+
+        self.appearance_dialog = dialog
+        self.opacity_scale = opacity_scale
+
+    def on_opacity_scale_changed(self, scale: Gtk.Scale) -> None:
+        self.set_background_opacity(scale.get_value() / 100.0)
+
+    def on_appearance_dialog_response(self, dialog: Gtk.Dialog, _response: int) -> None:
+        dialog.destroy()
+        self.appearance_dialog = None
+        self.opacity_scale = None
 
     def on_search_toggle_toggled(self, button: Gtk.ToggleButton) -> None:
         self.search_bar.set_search_mode(button.get_active())
@@ -819,6 +1053,9 @@ class TTerminalWindow(Gtk.ApplicationWindow):
     def action_zoom_reset(self, _action: Gio.SimpleAction, _parameter: GLib.Variant | None) -> None:
         self.set_font_scale(1.0)
 
+    def action_show_appearance(self, _action: Gio.SimpleAction, _parameter: GLib.Variant | None) -> None:
+        self.show_appearance_dialog()
+
     def action_next_tab(self, _action: Gio.SimpleAction, _parameter: GLib.Variant | None) -> None:
         page_count = self.notebook.get_n_pages()
         if page_count <= 1:
@@ -861,6 +1098,7 @@ class TTerminalApp(Gtk.Application):
     def do_startup(self) -> None:
         Gtk.Application.do_startup(self)
         log_debug("application startup")
+        install_application_css()
         self.set_accels_for_action("win.new-tab", ["<Primary><Shift>T"])
         self.set_accels_for_action("win.new-window", ["<Primary><Shift>N"])
         self.set_accels_for_action("win.close-tab", ["<Primary><Shift>W"])

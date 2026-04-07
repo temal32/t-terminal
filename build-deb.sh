@@ -29,7 +29,7 @@ install -m 644 "${project_dir}/README.md" "${package_root}/usr/share/doc/t-termi
 
 cat > "${package_root}/DEBIAN/control" <<EOF
 Package: t-terminal
-Version: 1.0
+Version: 1.2.1
 Section: utils
 Priority: optional
 Architecture: all

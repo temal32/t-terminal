@@ -13,6 +13,7 @@ After copying with `Ctrl+C`, the selection is cleared so the next `Ctrl+C` immed
 - Tabs with close buttons and tab reordering
 - New window and new tab actions
 - Terminal search bar with next/previous navigation
+- Adjustable background opacity with a saved appearance setting
 - Zoom in, zoom out, and reset zoom
 - Right-click context menu
 - Link detection with `Ctrl+Click` to open links
@@ -90,6 +91,10 @@ sudo update-alternatives --config x-terminal-emulator
 - `Ctrl` + mouse wheel: zoom in or out while keeping normal wheel scrolling
 - `Ctrl+PageDown` / `Ctrl+PageUp`: next or previous tab
 - `F11`: fullscreen
+
+## Appearance
+
+Open the top-right menu and choose `Appearance` to change the background opacity. `0` makes the terminal background fully transparent while keeping the text visible, and `100` makes it fully opaque. The chosen value is saved in `~/.config/t-terminal/settings.json` and used again the next time you start the terminal.
 
 ## Notes
 
