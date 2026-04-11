@@ -29,12 +29,12 @@ install -m 644 "${project_dir}/README.md" "${package_root}/usr/share/doc/t-termi
 
 cat > "${package_root}/DEBIAN/control" <<EOF
 Package: t-terminal
-Version: 1.2.1
+Version: 1.3.2
 Section: utils
 Priority: optional
 Architecture: all
 Maintainer: Temal <temal@localhost>
-Depends: python3, python3-gi, gir1.2-gtk-3.0, gir1.2-vte-2.91
+Depends: python3, python3-gi, gir1.2-gtk-3.0, gir1.2-vte-2.91, openssh-client, sshpass
 Provides: x-terminal-emulator
 Description: GTK/VTE terminal emulator with standard desktop features
  t-terminal is a GTK/VTE terminal emulator for Debian systems.

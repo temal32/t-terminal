@@ -14,6 +14,7 @@ After copying with `Ctrl+C`, the selection is cleared so the next `Ctrl+C` immed
 - New window and new tab actions
 - Terminal search bar with next/previous navigation
 - Adjustable background opacity with a saved appearance setting
+- Saved SSH profiles with direct connect from the header bar
 - Zoom in, zoom out, and reset zoom
 - Right-click context menu
 - Link detection with `Ctrl+Click` to open links
@@ -25,7 +26,7 @@ After copying with `Ctrl+C`, the selection is cleared so the next `Ctrl+C` immed
 Install the GTK and VTE bindings that the app uses:
 
 ```bash
-sudo apt install python3-gi gir1.2-gtk-3.0 gir1.2-vte-2.91
+sudo apt install python3-gi gir1.2-gtk-3.0 gir1.2-vte-2.91 openssh-client sshpass
 ```
 
 ## Run It
@@ -95,6 +96,12 @@ sudo update-alternatives --config x-terminal-emulator
 ## Appearance
 
 Open the top-right menu and choose `Appearance` to change the background opacity. `0` makes the terminal background fully transparent while keeping the text visible, and `100` makes it fully opaque. The chosen value is saved in `~/.config/t-terminal/settings.json` and used again the next time you start the terminal.
+
+## SSH Connections
+
+Use the server button in the header bar or the app menu entry `SSH Connections` to manage saved SSH servers. You can add, edit, delete, and connect to profiles with a saved name, host, port, username, and password.
+
+SSH profiles are saved in `~/.config/t-terminal/settings.json` so you can reconnect without typing the credentials again. Passwords are stored there locally in plain text because `t-terminal` uses them for direct `sshpass`-based logins.
 
 ## Notes
 

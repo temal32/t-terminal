@@ -10,6 +10,7 @@ import shutil
 import sys
 import time
 import urllib.parse
+import uuid
 
 import gi
 
@@ -22,12 +23,13 @@ from gi.repository import Gdk, Gio, GLib, Gtk, Pango, Vte
 
 APP_ID = "com.temal.tterminal"
 APP_NAME = "t-terminal"
-APP_VERSION = "1.2.1"
+APP_VERSION = "1.3.2"
 DEFAULT_FONT = "Monospace 12"
 URL_PATTERN = r"(?:https?|ftp)://[^\s\"'<>]+|mailto:[^\s\"'<>]+|file://[^\s\"'<>]+"
 CONFIG_DIR = pathlib.Path.home() / ".config" / "t-terminal"
 SETTINGS_PATH = CONFIG_DIR / "settings.json"
 DEFAULT_BACKGROUND_OPACITY = 1.0
+DEFAULT_SSH_PORT = 22
 COMPACT_CSS = b"""
 window.t-terminal-window headerbar {
   min-height: 34px;
@@ -190,6 +192,13 @@ def shorten_title(title: str, length: int = 28) -> str:
     return title[: length - 3] + "..."
 
 
+def wait_status_to_exit_code(status: int) -> int | None:
+    try:
+        return os.waitstatus_to_exitcode(status)
+    except ValueError:
+        return None
+
+
 def normalize_background_opacity(value: object) -> float:
     try:
         numeric_value = float(value)
@@ -198,8 +207,41 @@ def normalize_background_opacity(value: object) -> float:
     return max(0.0, min(1.0, numeric_value))
 
 
-def load_settings() -> dict[str, float]:
-    settings = {"background_opacity": DEFAULT_BACKGROUND_OPACITY}
+def normalize_ssh_port(value: object) -> int:
+    try:
+        port = int(value)
+    except (TypeError, ValueError):
+        port = DEFAULT_SSH_PORT
+    return max(1, min(65535, port))
+
+
+def normalize_ssh_profile(raw_profile: object) -> dict[str, object] | None:
+    if not isinstance(raw_profile, dict):
+        return None
+
+    host = str(raw_profile.get("host", "")).strip()
+    if not host:
+        return None
+
+    name = str(raw_profile.get("name", "")).strip() or host
+    username = str(raw_profile.get("username", "")).strip()
+    password = str(raw_profile.get("password", "") or "")
+
+    return {
+        "id": str(raw_profile.get("id", "")).strip() or uuid.uuid4().hex,
+        "name": name,
+        "host": host,
+        "port": normalize_ssh_port(raw_profile.get("port", DEFAULT_SSH_PORT)),
+        "username": username,
+        "password": password,
+    }
+
+
+def load_settings() -> dict[str, object]:
+    settings: dict[str, object] = {
+        "background_opacity": DEFAULT_BACKGROUND_OPACITY,
+        "ssh_profiles": [],
+    }
     try:
         if SETTINGS_PATH.exists():
             raw_settings = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
@@ -207,12 +249,19 @@ def load_settings() -> dict[str, float]:
                 settings["background_opacity"] = normalize_background_opacity(
                     raw_settings.get("background_opacity", DEFAULT_BACKGROUND_OPACITY)
                 )
+                raw_profiles = raw_settings.get("ssh_profiles", [])
+                if isinstance(raw_profiles, list):
+                    settings["ssh_profiles"] = [
+                        profile
+                        for profile in (normalize_ssh_profile(item) for item in raw_profiles)
+                        if profile is not None
+                    ]
     except (OSError, ValueError, TypeError) as error:
         log_debug(f"could not load settings: {error}")
     return settings
 
 
-def save_settings(settings: dict[str, float]) -> None:
+def save_settings(settings: dict[str, object]) -> None:
     try:
         CONFIG_DIR.mkdir(parents=True, exist_ok=True)
         SETTINGS_PATH.write_text(json.dumps(settings, indent=2), encoding="utf-8")
@@ -238,12 +287,16 @@ class TerminalTab(Gtk.Box):
         window: "TTerminalWindow",
         command: list[str] | None = None,
         working_directory: str | None = None,
+        session_type: str = "shell",
+        session_name: str | None = None,
     ) -> None:
         super().__init__(orientation=Gtk.Orientation.VERTICAL)
         self.window = window
         self.command = list(command) if command else None
         self.working_directory = working_directory
-        self.title = "Shell"
+        self.session_type = session_type
+        self.session_name = session_name or ""
+        self.title = session_name or "Shell"
         self.default_shell_launch = command is None
         self.fallback_commands = build_shell_fallback_commands() if self.default_shell_launch else []
         self.current_command_description = ""
@@ -389,6 +442,80 @@ class TerminalTab(Gtk.Box):
     def get_display_title(self) -> str:
         return self.title or "Shell"
 
+    def get_terminal_text(self) -> str:
+        text, _attributes = self.terminal.get_text(None, None)
+        if text:
+            return text.replace("\x00", "")
+
+        row_count = self.terminal.get_row_count()
+        column_count = self.terminal.get_column_count()
+        if row_count <= 0 or column_count <= 0:
+            return ""
+
+        text, _attributes = self.terminal.get_text_range(
+            0,
+            0,
+            row_count - 1,
+            max(column_count - 1, 0),
+            None,
+            None,
+        )
+        return text.replace("\x00", "") if text else ""
+
+    def get_recent_output(self, max_lines: int = 8) -> str:
+        text = self.get_terminal_text()
+        if not text:
+            return ""
+
+        lines = []
+        for line in text.splitlines():
+            cleaned = line.strip()
+            if cleaned:
+                lines.append(cleaned)
+
+        if not lines:
+            return ""
+
+        return "\n".join(lines[-max_lines:])
+
+    def get_recent_ssh_error_output(self, max_lines: int = 8) -> str:
+        lines = [line.strip() for line in self.get_terminal_text().splitlines() if line.strip()]
+        if not lines:
+            return ""
+
+        ssh_keywords = (
+            "ssh:",
+            "sshpass:",
+            "permission denied",
+            "connection refused",
+            "connection timed out",
+            "could not resolve hostname",
+            "host key verification failed",
+            "no route to host",
+            "connection closed",
+            "kex_exchange_identification",
+            "operation timed out",
+            "connection reset",
+            "broken pipe",
+        )
+        matching_lines = [line for line in lines if any(keyword in line.lower() for keyword in ssh_keywords)]
+        relevant_lines = matching_lines if matching_lines else lines
+        return "\n".join(relevant_lines[-max_lines:])
+
+    def build_ssh_failure_message(self, exit_code: int | None) -> str:
+        display_name = self.session_name or self.get_display_title() or "the SSH server"
+        details = self.get_recent_ssh_error_output()
+        message = f"Could not connect to {display_name}."
+        if details:
+            message += f"\n\n{details}"
+            if exit_code is not None:
+                message += f"\n\nSSH exited with code {exit_code}."
+        elif exit_code is not None:
+            message += f"\n\nSSH exited with code {exit_code}."
+        else:
+            message += "\n\nThe SSH process exited unexpectedly."
+        return message
+
     def get_current_working_directory(self) -> str:
         uri = self.terminal.get_current_directory_uri()
         if uri:
@@ -516,8 +643,10 @@ class TerminalTab(Gtk.Box):
 
     def on_child_exited(self, _terminal: Vte.Terminal, _status: int) -> None:
         runtime_seconds = time.monotonic() - self.last_spawn_monotonic if self.last_spawn_monotonic else 0.0
+        exit_code = wait_status_to_exit_code(_status)
         log_debug(
-            f"child exited status={_status} runtime_seconds={runtime_seconds:.3f} command={self.current_command_description!r}"
+            f"child exited status={_status} exit_code={exit_code!r} runtime_seconds={runtime_seconds:.3f} "
+            f"command={self.current_command_description!r}"
         )
 
         if self.default_shell_launch and runtime_seconds < 1.5 and self.fallback_commands:
@@ -531,6 +660,10 @@ class TerminalTab(Gtk.Box):
                 "The terminal shell exited immediately after startup.\n\n"
                 "A debug log was written to ~/.local/state/t-terminal.log."
             )
+
+        if self.session_type == "ssh" and exit_code not in (None, 0):
+            self.window.show_error_dialog(self.build_ssh_failure_message(exit_code))
+
         self.window.close_tab(self)
 
     def on_terminal_button_press(self, _terminal: Vte.Terminal, event: Gdk.EventButton) -> bool:
@@ -599,6 +732,12 @@ class TTerminalWindow(Gtk.ApplicationWindow):
         self.tab_labels: dict[TerminalTab, Gtk.Label] = {}
         self.appearance_dialog: Gtk.Dialog | None = None
         self.opacity_scale: Gtk.Scale | None = None
+        self.ssh_manager_dialog: Gtk.Dialog | None = None
+        self.ssh_profile_list: Gtk.ListBox | None = None
+        self.ssh_empty_label: Gtk.Label | None = None
+        self.ssh_connect_button: Gtk.Button | None = None
+        self.ssh_edit_button: Gtk.Button | None = None
+        self.ssh_delete_button: Gtk.Button | None = None
 
         self.set_default_size(1180, 780)
         self.set_title(APP_NAME)
@@ -630,6 +769,13 @@ class TTerminalWindow(Gtk.ApplicationWindow):
         self.new_tab_button.get_style_context().add_class("compact-button")
         self.new_tab_button.connect("clicked", lambda *_: self.create_tab())
         self.header_bar.pack_start(self.new_tab_button)
+
+        self.ssh_button = Gtk.Button.new_from_icon_name("network-server-symbolic", Gtk.IconSize.MENU)
+        self.ssh_button.set_tooltip_text("Manage saved SSH connections")
+        self.ssh_button.set_relief(Gtk.ReliefStyle.NONE)
+        self.ssh_button.get_style_context().add_class("compact-button")
+        self.ssh_button.connect("clicked", lambda *_: self.show_ssh_manager_dialog())
+        self.header_bar.pack_start(self.ssh_button)
 
         self.search_toggle = Gtk.ToggleButton()
         self.search_toggle.add(Gtk.Image.new_from_icon_name("edit-find-symbolic", Gtk.IconSize.MENU))
@@ -711,6 +857,7 @@ class TTerminalWindow(Gtk.ApplicationWindow):
             "find-next": self.action_find_next,
             "find-previous": self.action_find_previous,
             "show-appearance": self.action_show_appearance,
+            "show-ssh-manager": self.action_show_ssh_manager,
             "zoom-in": self.action_zoom_in,
             "zoom-out": self.action_zoom_out,
             "zoom-reset": self.action_zoom_reset,
@@ -732,6 +879,7 @@ class TTerminalWindow(Gtk.ApplicationWindow):
         file_section = Gio.Menu()
         file_section.append("New Tab", "win.new-tab")
         file_section.append("New Window", "win.new-window")
+        file_section.append("SSH Connections", "win.show-ssh-manager")
         file_section.append("Close Tab", "win.close-tab")
         menu.append_section(None, file_section)
 
@@ -762,6 +910,13 @@ class TTerminalWindow(Gtk.ApplicationWindow):
     def get_default_working_directory(self) -> str:
         return self.startup_directory or get_home_directory()
 
+    def get_ssh_profiles(self) -> list[dict[str, object]]:
+        profiles = self.settings.get("ssh_profiles")
+        if isinstance(profiles, list):
+            return profiles
+        self.settings["ssh_profiles"] = []
+        return self.settings["ssh_profiles"]
+
     def enable_rgba_visual_if_available(self) -> None:
         screen = Gdk.Screen.get_default()
         if screen is None or not screen.is_composited():
@@ -775,9 +930,17 @@ class TTerminalWindow(Gtk.ApplicationWindow):
         self,
         command: list[str] | None = None,
         working_directory: str | None = None,
+        session_type: str = "shell",
+        session_name: str | None = None,
     ) -> TerminalTab:
         directory = working_directory or self.get_active_working_directory() or self.get_default_working_directory()
-        tab = TerminalTab(self, command=command, working_directory=directory)
+        tab = TerminalTab(
+            self,
+            command=command,
+            working_directory=directory,
+            session_type=session_type,
+            session_name=session_name,
+        )
 
         tab_label = self.build_tab_label(tab)
         page_index = self.notebook.append_page(tab, tab_label)
@@ -971,6 +1134,377 @@ class TTerminalWindow(Gtk.ApplicationWindow):
         self.appearance_dialog = None
         self.opacity_scale = None
 
+    def show_ssh_manager_dialog(self) -> None:
+        if self.ssh_manager_dialog is not None:
+            self.populate_ssh_profile_list()
+            self.ssh_manager_dialog.present()
+            return
+
+        dialog = Gtk.Dialog(title="SSH Connections", transient_for=self, flags=Gtk.DialogFlags.MODAL)
+        dialog.add_button("Close", Gtk.ResponseType.CLOSE)
+        dialog.set_default_size(560, 420)
+        content_area = dialog.get_content_area()
+        content_area.set_border_width(12)
+
+        container = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        content_area.add(container)
+
+        hint_label = Gtk.Label(
+            label=(
+                "Save SSH servers and connect without re-entering the username or password.\n"
+                "Passwords are stored locally in ~/.config/t-terminal/settings.json."
+            )
+        )
+        hint_label.set_xalign(0.0)
+        hint_label.set_line_wrap(True)
+        container.pack_start(hint_label, False, False, 0)
+
+        scroller = Gtk.ScrolledWindow()
+        scroller.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        scroller.set_vexpand(True)
+
+        profile_list = Gtk.ListBox()
+        profile_list.set_activate_on_single_click(False)
+        profile_list.set_selection_mode(Gtk.SelectionMode.SINGLE)
+        profile_list.connect("row-selected", self.on_ssh_profile_selected)
+        profile_list.connect("row-activated", self.on_ssh_profile_row_activated)
+        scroller.add(profile_list)
+        container.pack_start(scroller, True, True, 0)
+
+        empty_label = Gtk.Label(label="No saved SSH connections yet.")
+        empty_label.set_xalign(0.0)
+        container.pack_start(empty_label, False, False, 0)
+
+        button_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        add_button = Gtk.Button(label="Add")
+        add_button.connect("clicked", lambda *_: self.add_ssh_profile())
+        button_row.pack_start(add_button, False, False, 0)
+
+        edit_button = Gtk.Button(label="Edit")
+        edit_button.connect("clicked", lambda *_: self.edit_selected_ssh_profile())
+        button_row.pack_start(edit_button, False, False, 0)
+
+        delete_button = Gtk.Button(label="Delete")
+        delete_button.connect("clicked", lambda *_: self.delete_selected_ssh_profile())
+        button_row.pack_start(delete_button, False, False, 0)
+
+        spacer = Gtk.Box()
+        button_row.pack_start(spacer, True, True, 0)
+
+        connect_button = Gtk.Button(label="Connect")
+        connect_button.get_style_context().add_class("suggested-action")
+        connect_button.connect("clicked", lambda *_: self.connect_selected_ssh_profile())
+        button_row.pack_start(connect_button, False, False, 0)
+
+        container.pack_start(button_row, False, False, 0)
+
+        dialog.connect("response", self.on_ssh_manager_dialog_response)
+        dialog.show_all()
+
+        self.ssh_manager_dialog = dialog
+        self.ssh_profile_list = profile_list
+        self.ssh_empty_label = empty_label
+        self.ssh_connect_button = connect_button
+        self.ssh_edit_button = edit_button
+        self.ssh_delete_button = delete_button
+
+        self.populate_ssh_profile_list()
+
+    def on_ssh_manager_dialog_response(self, dialog: Gtk.Dialog, _response: int) -> None:
+        dialog.destroy()
+        self.ssh_manager_dialog = None
+        self.ssh_profile_list = None
+        self.ssh_empty_label = None
+        self.ssh_connect_button = None
+        self.ssh_edit_button = None
+        self.ssh_delete_button = None
+
+    def populate_ssh_profile_list(self, selected_profile_id: str | None = None) -> None:
+        if self.ssh_profile_list is None:
+            return
+
+        for child in list(self.ssh_profile_list.get_children()):
+            self.ssh_profile_list.remove(child)
+
+        profiles = self.get_ssh_profiles()
+        for profile in profiles:
+            row = Gtk.ListBoxRow()
+            row.profile = profile
+
+            name = str(profile.get("name", "SSH"))
+            username = str(profile.get("username", "")).strip()
+            host = str(profile.get("host", "")).strip()
+            port = normalize_ssh_port(profile.get("port", DEFAULT_SSH_PORT))
+            target = f"{username}@{host}" if username else host
+
+            row_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+            row_box.set_border_width(8)
+
+            name_label = Gtk.Label(label=name)
+            name_label.set_xalign(0.0)
+            row_box.pack_start(name_label, False, False, 0)
+
+            detail_label = Gtk.Label(label=f"{target}:{port}")
+            detail_label.set_xalign(0.0)
+            detail_label.get_style_context().add_class("dim-label")
+            row_box.pack_start(detail_label, False, False, 0)
+
+            row.add(row_box)
+            self.ssh_profile_list.add(row)
+
+            if selected_profile_id and str(profile.get("id")) == selected_profile_id:
+                self.ssh_profile_list.select_row(row)
+
+        self.ssh_profile_list.show_all()
+
+        if self.ssh_empty_label is not None:
+            self.ssh_empty_label.set_visible(not profiles)
+
+        if selected_profile_id is None and profiles and self.ssh_profile_list.get_selected_row() is None:
+            first_row = self.ssh_profile_list.get_row_at_index(0)
+            if first_row is not None:
+                self.ssh_profile_list.select_row(first_row)
+
+        self.update_ssh_profile_actions()
+
+    def update_ssh_profile_actions(self) -> None:
+        has_selection = self.get_selected_ssh_profile() is not None
+        for button in (self.ssh_connect_button, self.ssh_edit_button, self.ssh_delete_button):
+            if button is not None:
+                button.set_sensitive(has_selection)
+
+    def get_selected_ssh_profile(self) -> dict[str, object] | None:
+        if self.ssh_profile_list is None:
+            return None
+        row = self.ssh_profile_list.get_selected_row()
+        if row is None:
+            return None
+        return getattr(row, "profile", None)
+
+    def on_ssh_profile_selected(self, _listbox: Gtk.ListBox, _row: Gtk.ListBoxRow | None) -> None:
+        self.update_ssh_profile_actions()
+
+    def on_ssh_profile_row_activated(self, _listbox: Gtk.ListBox, row: Gtk.ListBoxRow) -> None:
+        profile = getattr(row, "profile", None)
+        if isinstance(profile, dict):
+            self.connect_ssh_profile(profile)
+
+    def show_ssh_profile_editor(self, existing_profile: dict[str, object] | None = None) -> dict[str, object] | None:
+        dialog_title = "Add SSH Connection" if existing_profile is None else "Edit SSH Connection"
+        dialog = Gtk.Dialog(title=dialog_title, transient_for=self, flags=Gtk.DialogFlags.MODAL)
+        dialog.add_button("Cancel", Gtk.ResponseType.CANCEL)
+        dialog.add_button("Save", Gtk.ResponseType.OK)
+        dialog.set_default_response(Gtk.ResponseType.OK)
+        dialog.set_default_size(420, -1)
+
+        content_area = dialog.get_content_area()
+        content_area.set_border_width(12)
+
+        grid = Gtk.Grid(column_spacing=12, row_spacing=10)
+        content_area.add(grid)
+
+        def add_labeled_widget(row_index: int, label_text: str, widget: Gtk.Widget) -> None:
+            label = Gtk.Label(label=label_text)
+            label.set_xalign(0.0)
+            grid.attach(label, 0, row_index, 1, 1)
+            grid.attach(widget, 1, row_index, 1, 1)
+
+        name_entry = Gtk.Entry()
+        name_entry.set_text(str(existing_profile.get("name", "")) if existing_profile else "")
+        name_entry.set_activates_default(True)
+        add_labeled_widget(0, "Name", name_entry)
+
+        host_entry = Gtk.Entry()
+        host_entry.set_text(str(existing_profile.get("host", "")) if existing_profile else "")
+        host_entry.set_activates_default(True)
+        add_labeled_widget(1, "Host", host_entry)
+
+        port_adjustment = Gtk.Adjustment(
+            value=float(normalize_ssh_port(existing_profile.get("port", DEFAULT_SSH_PORT)) if existing_profile else DEFAULT_SSH_PORT),
+            lower=1,
+            upper=65535,
+            step_increment=1,
+            page_increment=10,
+            page_size=0,
+        )
+        port_spin = Gtk.SpinButton(adjustment=port_adjustment, climb_rate=1, digits=0)
+        add_labeled_widget(2, "Port", port_spin)
+
+        username_entry = Gtk.Entry()
+        username_entry.set_text(str(existing_profile.get("username", "")) if existing_profile else "")
+        username_entry.set_activates_default(True)
+        add_labeled_widget(3, "Username", username_entry)
+
+        password_entry = Gtk.Entry()
+        password_entry.set_text(str(existing_profile.get("password", "")) if existing_profile else "")
+        password_entry.set_visibility(False)
+        password_entry.set_activates_default(True)
+        if hasattr(password_entry, "set_input_purpose"):
+            password_entry.set_input_purpose(Gtk.InputPurpose.PASSWORD)
+        add_labeled_widget(4, "Password", password_entry)
+
+        show_password = Gtk.CheckButton(label="Show password")
+        show_password.connect("toggled", lambda button: password_entry.set_visibility(button.get_active()))
+        grid.attach(show_password, 1, 5, 1, 1)
+
+        note_label = Gtk.Label(
+            label="Saved passwords are stored locally in ~/.config/t-terminal/settings.json."
+        )
+        note_label.set_xalign(0.0)
+        note_label.set_line_wrap(True)
+        grid.attach(note_label, 0, 6, 2, 1)
+
+        dialog.show_all()
+
+        while True:
+            response = dialog.run()
+            if response != Gtk.ResponseType.OK:
+                dialog.destroy()
+                return None
+
+            host = host_entry.get_text().strip()
+            if not host:
+                self.show_error_dialog("Host is required for an SSH connection.")
+                continue
+
+            name = name_entry.get_text().strip() or host
+            profile = normalize_ssh_profile(
+                {
+                    "id": str(existing_profile.get("id")) if existing_profile else uuid.uuid4().hex,
+                    "name": name,
+                    "host": host,
+                    "port": port_spin.get_value_as_int(),
+                    "username": username_entry.get_text().strip(),
+                    "password": password_entry.get_text(),
+                }
+            )
+            dialog.destroy()
+            return profile
+
+    def add_ssh_profile(self) -> None:
+        profile = self.show_ssh_profile_editor()
+        if profile is None:
+            return
+        self.get_ssh_profiles().append(profile)
+        save_settings(self.settings)
+        self.populate_ssh_profile_list(str(profile.get("id")))
+
+    def edit_selected_ssh_profile(self) -> None:
+        selected_profile = self.get_selected_ssh_profile()
+        if selected_profile is None:
+            return
+
+        updated_profile = self.show_ssh_profile_editor(selected_profile)
+        if updated_profile is None:
+            return
+
+        profiles = self.get_ssh_profiles()
+        for index, profile in enumerate(profiles):
+            if str(profile.get("id")) == str(updated_profile.get("id")):
+                profiles[index] = updated_profile
+                break
+
+        save_settings(self.settings)
+        self.populate_ssh_profile_list(str(updated_profile.get("id")))
+
+    def delete_selected_ssh_profile(self) -> None:
+        selected_profile = self.get_selected_ssh_profile()
+        if selected_profile is None:
+            return
+
+        profile_name = str(selected_profile.get("name", "this SSH connection"))
+        confirm_dialog = Gtk.MessageDialog(
+            transient_for=self,
+            flags=Gtk.DialogFlags.MODAL,
+            message_type=Gtk.MessageType.QUESTION,
+            buttons=Gtk.ButtonsType.OK_CANCEL,
+            text="Delete saved SSH connection?",
+        )
+        confirm_dialog.format_secondary_text(f"{profile_name} will be removed from the saved SSH profiles.")
+        response = confirm_dialog.run()
+        confirm_dialog.destroy()
+
+        if response != Gtk.ResponseType.OK:
+            return
+
+        profiles = self.get_ssh_profiles()
+        profiles[:] = [profile for profile in profiles if str(profile.get("id")) != str(selected_profile.get("id"))]
+        save_settings(self.settings)
+        self.populate_ssh_profile_list()
+
+    def build_ssh_command(self, profile: dict[str, object]) -> list[str] | None:
+        ssh_path = resolve_executable("ssh")
+        if ssh_path is None:
+            self.show_error_dialog("OpenSSH client is not installed. Please install openssh-client first.")
+            return None
+
+        host = str(profile.get("host", "")).strip()
+        username = str(profile.get("username", "")).strip()
+        password = str(profile.get("password", "") or "")
+        port = normalize_ssh_port(profile.get("port", DEFAULT_SSH_PORT))
+        target = f"{username}@{host}" if username else host
+
+        ssh_command = [
+            ssh_path,
+            "-o",
+            "StrictHostKeyChecking=accept-new",
+            "-p",
+            str(port),
+            target,
+        ]
+
+        if not password:
+            return ssh_command
+
+        sshpass_path = resolve_executable("sshpass")
+        if sshpass_path is None:
+            self.show_error_dialog(
+                "Saved-password SSH connections require sshpass.\n\nInstall it with: sudo apt install sshpass"
+            )
+            return None
+
+        return [
+            sshpass_path,
+            "-p",
+            password,
+            ssh_path,
+            "-o",
+            "PreferredAuthentications=password,keyboard-interactive",
+            "-o",
+            "PubkeyAuthentication=no",
+            "-o",
+            "NumberOfPasswordPrompts=1",
+            "-o",
+            "StrictHostKeyChecking=accept-new",
+            "-p",
+            str(port),
+            target,
+        ]
+
+    def connect_ssh_profile(self, profile: dict[str, object]) -> None:
+        command = self.build_ssh_command(profile)
+        if command is None:
+            return
+
+        profile_name = str(profile.get("name", "SSH"))
+        tab = self.create_tab(
+            command=command,
+            working_directory=get_home_directory(),
+            session_type="ssh",
+            session_name=profile_name,
+        )
+        tab.update_title(str(profile.get("name", "SSH")))
+        log_debug(f"opening ssh connection profile={profile.get('name')!r} host={profile.get('host')!r}")
+
+        if self.ssh_manager_dialog is not None:
+            self.ssh_manager_dialog.response(Gtk.ResponseType.CLOSE)
+
+    def connect_selected_ssh_profile(self) -> None:
+        selected_profile = self.get_selected_ssh_profile()
+        if selected_profile is None:
+            return
+        self.connect_ssh_profile(selected_profile)
+
     def on_search_toggle_toggled(self, button: Gtk.ToggleButton) -> None:
         self.search_bar.set_search_mode(button.get_active())
 
@@ -1055,6 +1589,9 @@ class TTerminalWindow(Gtk.ApplicationWindow):
 
     def action_show_appearance(self, _action: Gio.SimpleAction, _parameter: GLib.Variant | None) -> None:
         self.show_appearance_dialog()
+
+    def action_show_ssh_manager(self, _action: Gio.SimpleAction, _parameter: GLib.Variant | None) -> None:
+        self.show_ssh_manager_dialog()
 
     def action_next_tab(self, _action: Gio.SimpleAction, _parameter: GLib.Variant | None) -> None:
         page_count = self.notebook.get_n_pages()
